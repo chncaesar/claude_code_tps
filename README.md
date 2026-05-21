@@ -24,9 +24,11 @@ Zero external dependencies — uses only Python standard library.
 # Terminal 1: start the monitor
 python3 cc_tps_monitor.py
 
-# Terminal 2: run Claude Code normally
+# Terminal 2: run Claude Code — override ANTHROPIC_BASE_URL to use proxy
 ANTHROPIC_BASE_URL=http://localhost:18384 claude
 ```
+
+> Note: your global `ANTHROPIC_BASE_URL` (if set) is read by the monitor as its upstream. The per-command override above only affects Claude Code.
 
 Every LLM request that Claude Code makes will be logged with its TPS in Terminal 1.
 

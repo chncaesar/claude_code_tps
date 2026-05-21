@@ -21,7 +21,11 @@ Usage:
     python cc_tps_monitor.py
 
     # Terminal 2: run Claude Code pointing at the proxy
+    # (overrides your global ANTHROPIC_BASE_URL just for this command)
     ANTHROPIC_BASE_URL=http://localhost:18384 claude
+
+The monitor reads your environment's ANTHROPIC_BASE_URL (if set) to
+determine the upstream, or defaults to api.anthropic.com.
 """
 
 import os
@@ -337,8 +341,8 @@ def main() -> None:
   ╔══════════════════════════════════════════════════════════╗
   ║              Claude Code TPS Monitor                    ║
   ║                                                          ║
-  ║  Listening   →  http://localhost:{PORT:<5}               ║
-  ║  Usage       →  ANTHROPIC_BASE_URL=http://localhost:{PORT} claude    ║
+  ║  Proxy addr  →  http://localhost:{PORT:<5}               ║
+  ║  Upstream    →  {UPSTREAM_HOST}:{UPSTREAM_PORT:<5}{UPSTREAM_PATH_PREFIX:<12}  ║
   ║  Log file    →  {LOG_FILE:<47}║
   ╚══════════════════════════════════════════════════════════╝
 """

@@ -338,7 +338,7 @@ def main() -> None:
   ║              Claude Code TPS Monitor                    ║
   ║                                                          ║
   ║  Listening   →  http://localhost:{PORT:<5}               ║
-  ║  Usage       →  ANTHROPIC_BASE_URL=http://localhost:{PORT}/ claude  ║
+  ║  Usage       →  ANTHROPIC_BASE_URL=http://localhost:{PORT} claude    ║
   ║  Log file    →  {LOG_FILE:<47}║
   ╚══════════════════════════════════════════════════════════╝
 """

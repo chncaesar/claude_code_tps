@@ -34,12 +34,29 @@ import http.client
 import http.server
 import threading
 from datetime import datetime
+from urllib.parse import urlparse
 
 # ── Configuration (via env vars) ────────────────────────────────────────
 PORT = int(os.environ.get("CC_TPS_PORT", "18384"))
-UPSTREAM_HOST = os.environ.get("CC_TPS_UPSTREAM_HOST", "api.anthropic.com")
-UPSTREAM_PORT = int(os.environ.get("CC_TPS_UPSTREAM_PORT", "443"))
 LOG_FILE = os.environ.get("CC_TPS_LOG", "cc_tps.log")
+
+# Upstream: infer from ANTHROPIC_BASE_URL, then explicit overrides, then defaults.
+_base_url = os.environ.get("ANTHROPIC_BASE_URL", "")
+if _base_url:
+    _parsed = urlparse(_base_url)
+    UPSTREAM_SCHEME = _parsed.scheme  # http or https
+    UPSTREAM_HOST = _parsed.hostname or "api.anthropic.com"
+    UPSTREAM_PORT = _parsed.port or (443 if UPSTREAM_SCHEME == "https" else 80)
+    UPSTREAM_PATH_PREFIX = _parsed.path.rstrip("/")  # e.g. "" or "/anthropic"
+else:
+    UPSTREAM_SCHEME = "https"
+    UPSTREAM_HOST = "api.anthropic.com"
+    UPSTREAM_PORT = 443
+    UPSTREAM_PATH_PREFIX = ""
+
+# Explicit overrides take precedence.
+UPSTREAM_HOST = os.environ.get("CC_TPS_UPSTREAM_HOST", UPSTREAM_HOST)
+UPSTREAM_PORT = int(os.environ.get("CC_TPS_UPSTREAM_PORT", str(UPSTREAM_PORT)))
 
 # ── Stats data model ────────────────────────────────────────────────────
 stats_lock = threading.Lock()
@@ -232,15 +249,24 @@ class TPSProxyHandler(http.server.BaseHTTPRequestHandler):
         headers = {k: v for k, v in self.headers.items() if k.lower() != "host"}
         is_messages = (method == "POST" and "/v1/messages" in self.path)
 
+        # Forwarded path includes the upstream prefix (e.g. /anthropic/v1/messages)
+        upstream_path = UPSTREAM_PATH_PREFIX + self.path
+
         try:
-            conn = http.client.HTTPSConnection(
-                UPSTREAM_HOST, UPSTREAM_PORT,
-                context=ssl.create_default_context(),
-                timeout=600,
-            )
+            if UPSTREAM_SCHEME == "https":
+                conn: http.client.HTTPConnection = http.client.HTTPSConnection(
+                    UPSTREAM_HOST, UPSTREAM_PORT,
+                    context=ssl.create_default_context(),
+                    timeout=600,
+                )
+            else:
+                conn = http.client.HTTPConnection(
+                    UPSTREAM_HOST, UPSTREAM_PORT,
+                    timeout=600,
+                )
 
             t0 = time.monotonic()
-            conn.request(method, self.path, body=body, headers=headers)
+            conn.request(method, upstream_path, body=body, headers=headers)
             upstream = conn.getresponse()
 
             # ── Read full response ───────────────────────────────

@@ -90,9 +90,21 @@ python3 cc_tps_analyze.py --cost         # include cost estimate
 |---|---|---|
 | `CC_TPS_PORT` | `18384` | Local proxy port |
 | `CC_TPS_LOG` | `cc_tps.log` | JSONL log path |
+| `CC_TPS_UPSTREAM_HOST` | *(see below)* | Upstream host override |
+| `CC_TPS_UPSTREAM_PORT` | *(see below)* | Upstream port override |
+
+The proxy auto-detects the upstream from your environment:
+
+1. If `ANTHROPIC_BASE_URL` is set (e.g. `https://api.deepseek.com/anthropic`), the proxy parses the host, port, and path prefix from it. This means **no extra configuration is needed** when using a custom upstream.
+2. `CC_TPS_UPSTREAM_HOST` / `CC_TPS_UPSTREAM_PORT` explicitly override the detected values.
+3. Falls back to `api.anthropic.com:443`.
 
 ```bash
-CC_TPS_PORT=9999 CC_TPS_LOG=~/claude-metrics.jsonl python3 cc_tps_monitor.py
+# ANTHROPIC_BASE_URL already set → proxy uses it automatically
+python3 cc_tps_monitor.py
+
+# Explicit override if needed
+CC_TPS_UPSTREAM_HOST=custom.host.com python3 cc_tps_monitor.py
 ```
 
 ## How It Works

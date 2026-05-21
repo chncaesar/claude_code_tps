@@ -253,6 +253,31 @@ def compute_per_model(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return result
 
 
+def compute_per_session(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Group records by their session_id field."""
+    groups: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for r in records:
+        sid = r.get("session_id", 0) or 0
+        groups[sid].append(r)
+
+    result = []
+    for sid in sorted(groups):
+        reqs = groups[sid]
+        in_tok = sum(r.get("input_tokens", 0) for r in reqs)
+        out_tok = sum(r.get("output_tokens", 0) for r in reqs)
+        wall = sum(r.get("duration_ms", 0) for r in reqs)
+        tps_list = [r.get("tps", 0) for r in reqs if r.get("tps", 0) > 0]
+        result.append({
+            "session_id": sid,
+            "request_count": len(reqs),
+            "total_input_tokens": in_tok,
+            "total_output_tokens": out_tok,
+            "average_tps": out_tok / (wall / 1000) if wall > 0 else 0,
+            "average_latency_ms": statistics.mean([r.get("duration_ms", 0) for r in reqs]) if reqs else 0,
+        })
+    return result
+
+
 def compute_timeseries(
     records: list[dict[str, Any]],
     window_secs: int = 60,
@@ -459,6 +484,25 @@ def report_table(report: dict[str, Any]) -> None:
         print_table(h, r)
         print()
 
+    # ── Per-session breakdown ──
+    per_session = report.get("per_session", [])
+    if len(per_session) > 1:
+        h = ["Session", "Req", "In Tokens", "Out Tokens", "Avg TPS", "Avg Lat"]
+        r = []
+        for s in per_session:
+            r.append([
+                f"S{s['session_id']}" if s["session_id"] else "-",
+                str(s["request_count"]),
+                f"{s['total_input_tokens']:,}",
+                f"{s['total_output_tokens']:,}",
+                f"{s['average_tps']:.1f}",
+                fmt_duration(s["average_latency_ms"]),
+            ])
+        print("  Per-session breakdown")
+        print("  " + "─" * 60)
+        print_table(h, r)
+        print()
+
     # ── Time series ──
     if timeseries:
         h = ["Time Window", "Req", "Avg TPS", "Avg Lat", "Output"]
@@ -550,6 +594,8 @@ def build_report(
 
     if include_per_model:
         report["per_model"] = compute_per_model(records)
+
+    report["per_session"] = compute_per_session(records)
 
     if include_timeseries:
         report["timeseries"] = compute_timeseries(records, window_secs)

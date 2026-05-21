@@ -67,21 +67,53 @@ stats_lock = threading.Lock()
 all_stats: list[dict] = []
 session_start = time.time()
 
+# Session tracking: each unique TCP connection gets a sequential ID.
+_next_session_id: int = 1
+_session_id_lock = threading.Lock()
+# Map client_address -> assigned session ID (cleaned up on handler close)
+_active_sessions: dict[str, int] = {}
 
-def record_stat(model: str, input_tokens: int, output_tokens: int, duration_ms: float) -> None:
+
+def _new_session_id(client_addr: tuple[str, int]) -> int:
+    """Assign a new session ID for a client address."""
+    global _next_session_id
+    with _session_id_lock:
+        sid = _next_session_id
+        _next_session_id += 1
+        key = f"{client_addr[0]}:{client_addr[1]}"
+        _active_sessions[key] = sid
+        return sid
+
+
+def release_session(client_addr: tuple[str, int]) -> None:
+    """Release a session ID when the connection closes."""
+    key = f"{client_addr[0]}:{client_addr[1]}"
+    with _session_id_lock:
+        _active_sessions.pop(key, None)
+
+
+def record_stat(
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    duration_ms: float,
+    session_id: int = 0,
+) -> None:
     """Record a completed request and print a live stat line to stderr."""
     tps = output_tokens / (duration_ms / 1000) if duration_ms > 0 else 0.0
     ts = datetime.now().strftime("%H:%M:%S")
 
-    line = (f"  {ts}  {model[:42]:42s} │ "
+    sid_tag = f"S{session_id:>3d}" if session_id else "   -"
+    line = (f"  {sid_tag}  {ts}  {model[:40]:40s} │ "
             f"in:{input_tokens:>6}  out:{output_tokens:>6}  "
             f"t:{duration_ms / 1000:>5.2f}s  "
             f"TPS:{tps:>7.1f}")
 
-    entry = {
+    entry: dict[str, object] = {
         "timestamp": ts,
         "iso_timestamp": datetime.now().isoformat(),
         "unix_ts": time.time(),
+        "session_id": session_id,
         "model": model,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
@@ -144,6 +176,28 @@ def print_summary() -> None:
             print(f"  {model[:42]:42s} {len(reqs):>5} {m_in:>11,} {m_out:>11,} {m_tps:>9.1f}",
                   file=sys.stderr)
         print(file=sys.stderr)
+
+        # Session breakdown (only shown when multiple sessions exist)
+        by_session: dict[int, list[dict]] = {}
+        for s in all_stats:
+            sid = s.get("session_id", 0) or 0
+            by_session.setdefault(sid, []).append(s)
+        if len(by_session) > 1:
+            print("  Per-session breakdown", file=sys.stderr)
+            print("  " + "─" * 60, file=sys.stderr)
+            sh = f"  {'Sess':>6} {'Req':>5} {'In Tokens':>11} {'Out Tokens':>11} {'Avg TPS':>9}"
+            ss = f"  {'─' * 6} {'─' * 5} {'─' * 11} {'─' * 11} {'─' * 9}"
+            print(sh, file=sys.stderr)
+            print(ss, file=sys.stderr)
+            for sid in sorted(by_session):
+                reqs = by_session[sid]
+                s_in = sum(r["input_tokens"] for r in reqs)
+                s_out = sum(r["output_tokens"] for r in reqs)
+                s_time = sum(r["duration_ms"] for r in reqs) / 1000
+                s_tps = s_out / s_time if s_time > 0 else 0
+                print(f"  S{sid:>4d}  {len(reqs):>5} {s_in:>11,} {s_out:>11,} {s_tps:>9.1f}",
+                      file=sys.stderr)
+            print(file=sys.stderr)
 
 
 # ── SSE parser ──────────────────────────────────────────────────────────
@@ -224,6 +278,16 @@ class SSETokenParser:
 class TPSProxyHandler(http.server.BaseHTTPRequestHandler):
     """Forward requests to api.anthropic.com and extract token usage."""
 
+    # Each handler instance serves one TCP connection.
+    # Assign a session ID for every new connection.
+    def setup(self) -> None:
+        super().setup()
+        self._session_id = _new_session_id(self.client_address)
+
+    def finish(self) -> None:
+        release_session(self.client_address)
+        super().finish()
+
     # Silence the default "GET / ..." log lines
     def log_message(self, fmt: str, *args: object) -> None:
         pass
@@ -289,6 +353,7 @@ class TPSProxyHandler(http.server.BaseHTTPRequestHandler):
                             parser.input_tokens,
                             parser.output_tokens,
                             duration_ms,
+                            session_id=self._session_id,
                         )
                 elif "application/json" in ct:
                     try:
@@ -300,6 +365,7 @@ class TPSProxyHandler(http.server.BaseHTTPRequestHandler):
                                 usage.get("input_tokens", 0) or 0,
                                 usage.get("output_tokens", 0) or 0,
                                 duration_ms,
+                                session_id=self._session_id,
                             )
                     except json.JSONDecodeError:
                         pass
@@ -343,12 +409,13 @@ def main() -> None:
   ║                                                          ║
   ║  Proxy addr  →  http://localhost:{PORT:<5}               ║
   ║  Upstream    →  {UPSTREAM_HOST}:{UPSTREAM_PORT:<5}{UPSTREAM_PATH_PREFIX:<12}  ║
+  ║  Run →  ANTHROPIC_BASE_URL=localhost:{PORT} claude       ║
   ║  Log file    →  {LOG_FILE:<47}║
   ╚══════════════════════════════════════════════════════════╝
 """
     # Column header
-    header = f"  {'Time':8s}  {'Model':42s} │ {'In':>6} {'Out':>6} {'Time':>6} {'TPS':>7}"
-    sep = f"  {'─' * 8}  {'─' * 42} │ {'─' * 6} {'─' * 6} {'─' * 6} {'─' * 7}"
+    header = f"  {'Sess':>4}  {'Time':8s}  {'Model':40s} │ {'In':>6} {'Out':>6} {'Time':>6} {'TPS':>7}"
+    sep = f"  {'─' * 4}  {'─' * 8}  {'─' * 40} │ {'─' * 6} {'─' * 6} {'─' * 6} {'─' * 7}"
 
     print(banner, file=sys.stderr)
     print(header, file=sys.stderr)

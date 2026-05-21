@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+# Copyright 2025 Claude Code TPS Monitor Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+Claude Code TPS Monitor — local MITM proxy for tracking tokens-per-second.
+
+Usage:
+    # Terminal 1: start the monitor
+    python cc_tps_monitor.py
+
+    # Terminal 2: run Claude Code pointing at the proxy
+    ANTHROPIC_BASE_URL=http://localhost:18384 claude
+"""
+
+import os
+import sys
+import json
+import time
+import signal
+import ssl
+import http.client
+import http.server
+import threading
+from datetime import datetime
+
+# ── Configuration (via env vars) ────────────────────────────────────────
+PORT = int(os.environ.get("CC_TPS_PORT", "18384"))
+UPSTREAM_HOST = "api.anthropic.com"
+UPSTREAM_PORT = 443
+LOG_FILE = os.environ.get("CC_TPS_LOG", "cc_tps.log")
+
+# ── Stats data model ────────────────────────────────────────────────────
+stats_lock = threading.Lock()
+all_stats: list[dict] = []
+session_start = time.time()
+
+
+def record_stat(model: str, input_tokens: int, output_tokens: int, duration_ms: float) -> None:
+    """Record a completed request and print a live stat line to stderr."""
+    tps = output_tokens / (duration_ms / 1000) if duration_ms > 0 else 0.0
+    ts = datetime.now().strftime("%H:%M:%S")
+
+    line = (f"  {ts}  {model[:42]:42s} │ "
+            f"in:{input_tokens:>6}  out:{output_tokens:>6}  "
+            f"t:{duration_ms / 1000:>5.2f}s  "
+            f"TPS:{tps:>7.1f}")
+
+    entry = {
+        "timestamp": ts,
+        "iso_timestamp": datetime.now().isoformat(),
+        "unix_ts": time.time(),
+        "model": model,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "duration_ms": round(duration_ms, 1),
+        "tps": round(tps, 1),
+    }
+
+    with stats_lock:
+        all_stats.append(entry)
+
+    # Write log
+    with open(LOG_FILE, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+    # Live display to stderr
+    print(line, file=sys.stderr)
+
+
+def print_summary() -> None:
+    """Print aggregated session summary to stderr."""
+    with stats_lock:
+        if not all_stats:
+            return
+
+        elapsed = time.time() - session_start
+        total_in = sum(s["input_tokens"] for s in all_stats)
+        total_out = sum(s["output_tokens"] for s in all_stats)
+        total_wall = sum(s["duration_ms"] for s in all_stats) / 1000
+        avg_tps = total_out / total_wall if total_wall > 0 else 0
+
+        by_model: dict[str, list[dict]] = {}
+        for s in all_stats:
+            by_model.setdefault(s["model"], []).append(s)
+
+        print(file=sys.stderr)
+        print("  ╔════════════════════════════════════════════════════════════════╗",
+              file=sys.stderr)
+        print("  ║               TPS Monitor — Session Summary                  ║",
+              file=sys.stderr)
+        print("  ╚════════════════════════════════════════════════════════════════╝",
+              file=sys.stderr)
+        print(f"  Total requests:    {len(all_stats)}", file=sys.stderr)
+        print(f"  Session duration:  {elapsed:.1f}s", file=sys.stderr)
+        print(f"  Total input:       {total_in:>8,} tokens", file=sys.stderr)
+        print(f"  Total output:      {total_out:>8,} tokens", file=sys.stderr)
+        print(f"  Total wall time:   {total_wall:.1f}s", file=sys.stderr)
+        print(f"  Average TPS:       {avg_tps:.1f}", file=sys.stderr)
+        print(file=sys.stderr)
+
+        # Model breakdown
+        header = f"  {'Model':42s} {'Req':>5} {'In Tokens':>11} {'Out Tokens':>11} {'Avg TPS':>9}"
+        sep = f"  {'─' * 42} {'─' * 5} {'─' * 11} {'─' * 11} {'─' * 9}"
+        print(header, file=sys.stderr)
+        print(sep, file=sys.stderr)
+        for model, reqs in sorted(by_model.items()):
+            m_in = sum(r["input_tokens"] for r in reqs)
+            m_out = sum(r["output_tokens"] for r in reqs)
+            m_time = sum(r["duration_ms"] for r in reqs) / 1000
+            m_tps = m_out / m_time if m_time > 0 else 0
+            print(f"  {model[:42]:42s} {len(reqs):>5} {m_in:>11,} {m_out:>11,} {m_tps:>9.1f}",
+                  file=sys.stderr)
+        print(file=sys.stderr)
+
+
+# ── SSE parser ──────────────────────────────────────────────────────────
+
+class SSETokenParser:
+    """Extract token usage & model from an Anthropic SSE response stream.
+
+    Feeds:
+      - ``message_start``  → input_tokens, model
+      - ``message_delta``  → output_tokens
+      - ``message_stop``   → marks completion
+    """
+
+    def __init__(self) -> None:
+        self.buf = b""
+        self.input_tokens: int = 0
+        self.output_tokens: int = 0
+        self.model: str = "unknown"
+        self._done: bool = False
+
+    @property
+    def done(self) -> bool:
+        return self._done
+
+    def feed(self, data: bytes) -> None:
+        if self._done or not data:
+            return
+        self.buf += data
+        while b"\n\n" in self.buf:
+            raw_event, self.buf = self.buf.split(b"\n\n", 1)
+            self._parse(raw_event)
+
+    @staticmethod
+    def _extract(line: bytes, prefix: bytes) -> bytes | None:
+        if line.startswith(prefix):
+            return line[len(prefix):]
+        return None
+
+    def _parse(self, raw: bytes) -> None:
+        event_type: str | None = None
+        data_line: bytes | None = None
+
+        for line in raw.split(b"\n"):
+            stripped = line.strip()
+            if stripped.startswith(b"event: "):
+                event_type = stripped[7:].decode()
+            elif stripped.startswith(b"data: "):
+                data_line = stripped[6:]
+
+        if data_line is None:
+            return
+
+        try:
+            payload = json.loads(data_line)
+        except json.JSONDecodeError:
+            return
+
+        if event_type == "message_start":
+            msg = payload.get("message", {})
+            usage = msg.get("usage", {})
+            self.input_tokens = usage.get("input_tokens", 0) or 0
+            if usage.get("output_tokens"):
+                self.output_tokens = usage["output_tokens"]
+            if msg.get("model"):
+                self.model = msg["model"]
+
+        elif event_type == "message_delta":
+            usage = payload.get("usage", {})
+            if usage.get("output_tokens"):
+                self.output_tokens = usage["output_tokens"]
+
+        elif event_type == "message_stop":
+            self._done = True
+
+
+# ── HTTP proxy handler ─────────────────────────────────────────────────
+
+class TPSProxyHandler(http.server.BaseHTTPRequestHandler):
+    """Forward requests to api.anthropic.com and extract token usage."""
+
+    # Silence the default "GET / ..." log lines
+    def log_message(self, fmt: str, *args: object) -> None:
+        pass
+
+    # ── HTTP method dispatchers ──────────────────────────────────────
+
+    def do_GET(self) -> None:
+        self._proxy("GET")
+
+    def do_POST(self) -> None:
+        self._proxy("POST")
+
+    def do_PUT(self) -> None:
+        self._proxy("PUT")
+
+    def do_DELETE(self) -> None:
+        self._proxy("DELETE")
+
+    # ── Core proxy logic ─────────────────────────────────────────────
+
+    def _proxy(self, method: str) -> None:
+        body = b""
+        cl = int(self.headers.get("Content-Length", 0))
+        if cl > 0:
+            body = self.rfile.read(cl)
+
+        headers = {k: v for k, v in self.headers.items() if k.lower() != "host"}
+        is_messages = (method == "POST" and "/v1/messages" in self.path)
+
+        try:
+            conn = http.client.HTTPSConnection(
+                UPSTREAM_HOST, UPSTREAM_PORT,
+                context=ssl.create_default_context(),
+                timeout=600,
+            )
+
+            t0 = time.monotonic()
+            conn.request(method, self.path, body=body, headers=headers)
+            upstream = conn.getresponse()
+
+            # ── Read full response ───────────────────────────────
+            resp_body = upstream.read()
+            duration_ms = (time.monotonic() - t0) * 1000
+
+            # ── Extract token usage if applicable ────────────────
+            if is_messages:
+                ct = upstream.getheader("Content-Type", "")
+                if "text/event-stream" in ct:
+                    parser = SSETokenParser()
+                    parser.feed(resp_body)
+                    if parser.input_tokens or parser.output_tokens:
+                        record_stat(
+                            parser.model,
+                            parser.input_tokens,
+                            parser.output_tokens,
+                            duration_ms,
+                        )
+                elif "application/json" in ct:
+                    try:
+                        data = json.loads(resp_body)
+                        usage = data.get("usage") or {}
+                        if usage.get("input_tokens") is not None or usage.get("output_tokens") is not None:
+                            record_stat(
+                                data.get("model", "unknown"),
+                                usage.get("input_tokens", 0) or 0,
+                                usage.get("output_tokens", 0) or 0,
+                                duration_ms,
+                            )
+                    except json.JSONDecodeError:
+                        pass
+
+            # ── Forward response to client ──────────────────────
+            self.send_response(upstream.status)
+            for key, value in upstream.getheaders():
+                kl = key.lower()
+                if kl not in ("transfer-encoding", "content-encoding", "content-length", "alt-svc"):
+                    self.send_header(key, value)
+            self.end_headers()
+            self.wfile.write(resp_body)
+
+        except http.client.HTTPException as e:
+            self._error(502, f"Upstream HTTP error: {e}")
+        except (OSError, ssl.SSLError) as e:
+            self._error(502, f"Upstream connection error: {e}")
+        except Exception as e:
+            self._error(502, f"Proxy error: {e}")
+
+    def _error(self, status: int, msg: str) -> None:
+        body = json.dumps({"error": {"message": msg}}).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        print(f"  [!] {msg}", file=sys.stderr)
+
+
+# ── Entrypoint ──────────────────────────────────────────────────────────
+
+def main() -> None:
+    server = http.server.ThreadingHTTPServer(("", PORT), TPSProxyHandler)
+    server.timeout = 0.5  # allows clean KeyboardInterrupt
+
+    banner = f"""\
+
+  ╔══════════════════════════════════════════════════════════╗
+  ║              Claude Code TPS Monitor                    ║
+  ║                                                          ║
+  ║  Listening   →  http://localhost:{PORT:<5}               ║
+  ║  Usage       →  ANTHROPIC_BASE_URL=http://localhost:{PORT}/ claude  ║
+  ║  Log file    →  {LOG_FILE:<47}║
+  ╚══════════════════════════════════════════════════════════╝
+"""
+    # Column header
+    header = f"  {'Time':8s}  {'Model':42s} │ {'In':>6} {'Out':>6} {'Time':>6} {'TPS':>7}"
+    sep = f"  {'─' * 8}  {'─' * 42} │ {'─' * 6} {'─' * 6} {'─' * 6} {'─' * 7}"
+
+    print(banner, file=sys.stderr)
+    print(header, file=sys.stderr)
+    print(sep, file=sys.stderr)
+
+    # ── Ctrl+C handler ────────────────────────────────────────────
+    def shutdown(sig: int, frame: object) -> None:
+        print(file=sys.stderr)
+        print_summary()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, shutdown)
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        shutdown(0, None)
+
+
+if __name__ == "__main__":
+    main()

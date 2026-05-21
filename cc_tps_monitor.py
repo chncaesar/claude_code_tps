@@ -37,8 +37,8 @@ from datetime import datetime
 
 # ── Configuration (via env vars) ────────────────────────────────────────
 PORT = int(os.environ.get("CC_TPS_PORT", "18384"))
-UPSTREAM_HOST = "api.anthropic.com"
-UPSTREAM_PORT = 443
+UPSTREAM_HOST = os.environ.get("CC_TPS_UPSTREAM_HOST", "api.anthropic.com")
+UPSTREAM_PORT = int(os.environ.get("CC_TPS_UPSTREAM_PORT", "443"))
 LOG_FILE = os.environ.get("CC_TPS_LOG", "cc_tps.log")
 
 # ── Stats data model ────────────────────────────────────────────────────
